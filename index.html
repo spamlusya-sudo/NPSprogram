@@ -446,14 +446,120 @@ td input:focus,td select:focus{border-color:var(--orange);box-shadow:0 0 0 2px r
   </div>
 </div>
 
+
+<div id="syncBadge" style="position:fixed;right:18px;bottom:18px;z-index:9999;background:#1f2937;color:#fff;padding:10px 14px;border-radius:12px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.18);display:none">
+  Синхронизация...
+</div>
+
 </main>
 </div>
 
 <script>
 const SAFE=330;
 const fuelNames={'95':'АИ-95','92':'АИ-92','DT':'ДТ'};
+const REMOTE_STATE_URL='/.netlify/functions/site-state';
 let deliveries=[],sales=[],stockChartInst=null,forecastChartInst=null,wsChartInst=null;
 let stockRangeDays=30,forecastRangeDays=30;
+let isBootstrapping=true,saveTimer=null,lastLoadedAt=null,lastSavedHash='';
+
+function showSyncStatus(text,kind='info'){
+  const el=document.getElementById('syncBadge');
+  if(!el)return;
+  const bg=kind==='error'?'#b42318':(kind==='success'?'#067647':'#1f2937');
+  el.textContent=text;
+  el.style.background=bg;
+  el.style.display='block';
+  clearTimeout(el._hideTimer);
+  if(kind!=='info'){
+    el._hideTimer=setTimeout(()=>{el.style.display='none'},2600);
+  }
+}
+
+function collectState(){
+  return {
+    stock:getStock(),
+    daily:getDaily(),
+    deliveries:[...deliveries],
+    sales:[...sales],
+    stockRangeDays,
+    forecastRangeDays
+  };
+}
+
+function applyState(state){
+  if(!state||typeof state!=='object')return;
+  const stock=state.stock||{};
+  const daily=state.daily||{};
+  document.getElementById('inp95').value=stock['95'] ?? document.getElementById('inp95').value;
+  document.getElementById('inp92').value=stock['92'] ?? document.getElementById('inp92').value;
+  document.getElementById('inpDT').value=stock['DT'] ?? document.getElementById('inpDT').value;
+  document.getElementById('daily95').value=daily['95'] ?? document.getElementById('daily95').value;
+  document.getElementById('daily92').value=daily['92'] ?? document.getElementById('daily92').value;
+  document.getElementById('dailyDT').value=daily['DT'] ?? document.getElementById('dailyDT').value;
+  deliveries=Array.isArray(state.deliveries)?state.deliveries:[];
+  sales=Array.isArray(state.sales)?state.sales:[];
+  stockRangeDays=Number(state.stockRangeDays)||30;
+  forecastRangeDays=Number(state.forecastRangeDays)||30;
+  renderDeliveries();
+  renderSales();
+  syncRangeButtons();
+}
+
+function syncRangeButtons(){
+  const stockBtns=[...document.querySelectorAll('#tab-depot .range-btn')];
+  const forecastBtns=[...document.querySelectorAll('#tab-forecast .range-btn')];
+  const stockMap=[30,60,90],forecastMap=[30,60,90];
+  stockBtns.forEach((btn,i)=>btn.classList.toggle('active',stockMap[i]===stockRangeDays));
+  forecastBtns.forEach((btn,i)=>btn.classList.toggle('active',forecastMap[i]===forecastRangeDays));
+}
+
+async function loadRemoteState(){
+  showSyncStatus('Загружаю общие данные...');
+  try{
+    const res=await fetch(REMOTE_STATE_URL,{cache:'no-store'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const payload=await res.json();
+    if(payload && payload.state){
+      applyState(payload.state);
+      lastLoadedAt=payload.updatedAt || null;
+      lastSavedHash=JSON.stringify(collectState());
+      showSyncStatus('Общие данные загружены','success');
+    }else{
+      showSyncStatus('Работаю с начальными данными','success');
+    }
+  }catch(err){
+    console.error(err);
+    showSyncStatus('Не удалось загрузить общие данные','error');
+  }
+}
+
+async function saveRemoteState(){
+  const state=collectState();
+  const nextHash=JSON.stringify(state);
+  if(nextHash===lastSavedHash)return;
+  showSyncStatus('Сохраняю изменения...');
+  try{
+    const res=await fetch(REMOTE_STATE_URL,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({state,lastLoadedAt})
+    });
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const payload=await res.json();
+    lastLoadedAt=payload.updatedAt || new Date().toISOString();
+    lastSavedHash=nextHash;
+    showSyncStatus('Изменения сохранены для всех','success');
+  }catch(err){
+    console.error(err);
+    showSyncStatus('Ошибка сохранения','error');
+  }
+}
+
+function scheduleAutoSave(){
+  if(isBootstrapping)return;
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(saveRemoteState,800);
+}
 
 function todayISO(){const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
 function addDays(iso,n){const d=new Date(iso+'T00:00:00');d.setDate(d.getDate()+n);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
@@ -504,6 +610,7 @@ function updateAll(){
   });
   buildStockChart();
   if(document.getElementById('tab-forecast').classList.contains('active'))buildForecast();
+  scheduleAutoSave();
 }
 
 function setStockRange(n,btn){stockRangeDays=n;document.querySelectorAll('#tab-depot .range-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');buildStockChart()}
@@ -689,7 +796,16 @@ function buildWsChart(){
   wsChartInst=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label:'Маржа (₽)',data:margins,backgroundColor:colors,borderRadius:4,borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:'#fff',borderColor:'#e2e4e9',borderWidth:1,titleColor:'#5a6070',bodyColor:'#1a1d23',padding:10}},scales:{x:{grid:{color:'rgba(0,0,0,0.05)'},ticks:{color:'#9aa0ae',font:{size:11},maxRotation:45}},y:{grid:{color:'rgba(0,0,0,0.05)'},ticks:{color:'#9aa0ae',font:{size:11}}}}}});
 }
 
-updateAll();
+async function initApp(){
+  await loadRemoteState();
+  updateAll();
+  renderDeliveries();
+  renderSales();
+  buildWsChart();
+  isBootstrapping=false;
+}
+
+initApp();
 </script>
 </body>
 </html>
